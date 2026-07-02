@@ -29,7 +29,7 @@ impl Repo {
 }
 
 /// Scan base directories for git repositories.
-/// Fixed depth: base/host/owner/repo/.git
+/// Layout: base/host/owner/.../repo/.git (owner may contain nested groups)
 pub fn scan(base_dirs: &[PathBuf]) -> Result<Vec<Repo>> {
     let mut repos = Vec::new();
     for base in base_dirs {
@@ -44,7 +44,6 @@ pub fn scan(base_dirs: &[PathBuf]) -> Result<Vec<Repo>> {
 
 fn scan_base(base: &Path, repos: &mut Vec<Repo>) -> Result<()> {
     let base_path = base.to_path_buf();
-    // Level 1: host (github.com, gitlab.com, ...)
     let Ok(hosts) = std::fs::read_dir(base) else {
         return Ok(());
     };
@@ -57,45 +56,53 @@ fn scan_base(base: &Path, repos: &mut Vec<Repo>) -> Result<()> {
         if host_name.starts_with('.') {
             continue;
         }
+        scan_host_tree(&base_path, &host_name, &host_entry.path(), &host_entry.path(), repos)?;
+    }
+    Ok(())
+}
 
-        // Level 2: owner
-        let Ok(owners) = std::fs::read_dir(host_entry.path()) else {
+/// Recursively walk host/owner/... until a directory containing `.git` is found.
+fn scan_host_tree(
+    base: &Path,
+    host: &str,
+    host_root: &Path,
+    current: &Path,
+    repos: &mut Vec<Repo>,
+) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
             continue;
-        };
-        for owner_entry in owners {
-            let owner_entry = owner_entry?;
-            if !owner_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let owner_name = owner_entry.file_name().to_string_lossy().to_string();
-            if owner_name.starts_with('.') {
-                continue;
-            }
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if dir_name.starts_with('.') {
+            continue;
+        }
 
-            // Level 3: repo
-            let Ok(repo_entries) = std::fs::read_dir(owner_entry.path()) else {
-                continue;
-            };
-            for repo_entry in repo_entries {
-                let repo_entry = repo_entry?;
-                if !repo_entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let repo_name = repo_entry.file_name().to_string_lossy().to_string();
-                if repo_name.starts_with('.') {
-                    continue;
-                }
-
-                if repo_entry.path().join(".git").exists() {
-                    repos.push(Repo {
-                        path: repo_entry.path(),
-                        base: base_path.clone(),
-                        host: host_name.clone(),
-                        owner: owner_name.clone(),
-                        name: repo_name,
-                    });
-                }
+        let dir_path = entry.path();
+        if dir_path.join(".git").exists() {
+            let rel = dir_path
+                .strip_prefix(host_root)
+                .unwrap_or(&dir_path)
+                .to_string_lossy()
+                .into_owned();
+            let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+            if parts.len() >= 2 {
+                let owner = parts[0].to_string();
+                let name = parts[1..].join("/");
+                repos.push(Repo {
+                    path: dir_path,
+                    base: base.to_path_buf(),
+                    host: host.to_string(),
+                    owner,
+                    name,
+                });
             }
+        } else {
+            scan_host_tree(base, host, host_root, &dir_path, repos)?;
         }
     }
     Ok(())
@@ -306,5 +313,36 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("github.com/owner/repo/.git")).unwrap();
         let repos = scan(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(repos[0].base, dir.path());
+    }
+
+    #[test]
+    fn test_scan_nested_group_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("gitlab.com/team/subgroup/app/.git")).unwrap();
+        let repos = scan(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].host, "gitlab.com");
+        assert_eq!(repos[0].owner, "team");
+        assert_eq!(repos[0].name, "subgroup/app");
+        assert_eq!(repos[0].display_key(), "gitlab.com/team/subgroup/app");
+    }
+
+    #[test]
+    fn test_scan_deeply_nested_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("gitlab.com/org/a/b/c/project/.git")).unwrap();
+        let repos = scan(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].owner, "org");
+        assert_eq!(repos[0].name, "a/b/c/project");
+    }
+
+    #[test]
+    fn test_scan_mixed_depth_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("github.com/popomore/projj/.git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("gitlab.com/team/sub/app/.git")).unwrap();
+        let repos = scan(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(repos.len(), 2);
     }
 }
